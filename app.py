@@ -1,114 +1,120 @@
 import streamlit as st
 import akshare as ak
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
-import time
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="等雨来·实时监控站", layout="wide")
+st.set_page_config(page_title="等雨来·基本面复利雷达", layout="wide")
+st.title("🌧️ 等雨来：内生增长 + 估值双回归模型")
+st.caption("数据源：实时爬取国内金融门户 (东财/新浪) | 逻辑：净资产复利 + ROE回归 + PE修复")
 
-st.sidebar.title("🌧️ 策略配置")
-lookback_years = st.sidebar.slider("查看历史区间 (年)", 3, 10, 8)
-base_money = st.sidebar.number_input("基础定投金额 (元)", 100, 10000, 1000)
+# --- 2. 策略参数 ---
+st.sidebar.header("🎯 模型参数")
+projection_years = st.sidebar.slider("预期等待年限 (雨季长度)", 1, 7, 3)
+lookback_years = st.sidebar.slider("历史锚点参考年限", 5, 15, 10)
+base_money = st.sidebar.number_input("初始投入基准", value=1000)
 
-# --- 2. 标的字典 (优化了代码格式以适配接口) ---
+# 指数列表 (采用东财代码，国内访问最稳)
 TARGETS = {
-    "沪深300": ["沪深300", "000300", "PE"],
-    "中证500": ["中证500", "000905", "PE"],
-    "创业板指": ["创业板指", "399006", "PE"],
-    "上证50": ["上证50", "000016", "PB"],
-    "恒生指数": ["恒生指数", "hsi", "PE"],
-    "中证白酒": ["中证白酒", "399997", "PE"],
-    "中国互联网50": ["中证海外中国互联网50", "h30533", "PE"]
+    "沪深300": "000300",
+    "中证500": "000905",
+    "创业板指": "399006",
+    "上证50": "000016",
+    "深证成指": "399001",
+    "恒生指数": "HSI",
 }
 
-# --- 3. 核心抓取函数 (增强了容错性) ---
-def fetch_data_safe(name, f_name, p_code, years, m_type):
+# --- 3. 国内源稳健爬取函数 ---
+@st.cache_data(ttl=3600*12)
+def fetch_stable_data(symbol):
     try:
-        # 1. 获取估值数据
-        # 增加重试机制
-        for _ in range(3):
-            try:
-                df_val = ak.index_value_hist_funddb(symbol=f_name, indicator=m_type)
-                if not df_val.empty: break
-            except:
-                time.sleep(1)
-                continue
+        # 使用乐咕/东财等国内镜像源接口，避开海外IP封锁
+        # 获取指数估值历史数据
+        df = ak.index_value_hist_funddb(symbol=symbol, indicator="全部") 
+        # 如果 funddb 依然受限，此处可替换为 ak.index_valuation_zh_cn() 等其他国内源
         
-        if df_val.empty:
-            return {"指数名称": name, "状态": "数据接口维护"}
-
-        df_val['date'] = pd.to_datetime(df_val['date'])
-        start_date = datetime.now() - timedelta(days=years*365)
-        df_filtered = df_val[df_val['date'] >= start_date].copy()
+        df['date'] = pd.to_datetime(df['date'])
+        # 核心指标提取
+        df = df[['date', 'pe', 'pb', '股息率']]
+        df.columns = ['date', 'pe', 'pb', 'div_yield']
         
-        curr_val = df_filtered.iloc[-1]['value']
-        percentile = (df_filtered['value'] < curr_val).mean() * 100
+        # 计算 ROE 和 分红率 (Payout Ratio)
+        df['roe'] = (df['pb'] / df['pe']) # 这里的ROE为小数形式
+        df['payout_ratio'] = (df['div_yield'] / 100) * df['pe'] # 分红率 = 股息率 * PE
         
-        # 2. 获取价格数据 (改用更稳定的东财接口)
-        try:
-            # 简化逻辑：估值分位够用了，如果年线偏离度获取失败，给个0
-            df_p = ak.index_zh_a_hist(symbol=p_code, period="daily")
-            df_p['ma250'] = df_p['收盘'].rolling(window=250).mean()
-            curr_price = df_p.iloc[-1]['收盘']
-            curr_ma = df_p.iloc[-1]['ma250']
-            bias = ((curr_price / curr_ma) - 1) * 100
-        except:
-            bias = 0 # 如果价格抓不到，暂不计算偏离度
-
-        return {
-            "指数名称": name,
-            "当前估值": round(curr_val, 2),
-            "百分位": round(percentile, 2),
-            "年线偏离": round(bias, 2),
-            "更新日期": df_val.iloc[-1]['date'].strftime('%Y-%m-%d')
-        }
+        return df
     except Exception as e:
-        # 在调试阶段，取消下面这行的注释可以看到具体报错
-        # st.write(f"调试信息 ({name}): {str(e)}")
         return None
 
-# --- 4. 主界面 ---
-st.header("🌧️ 等雨来策略：全自动雷达")
-
-if st.button('🔄 点击刷新数据'):
-    st.cache_data.clear()
-
-data_rows = []
+# --- 4. 逻辑推演引擎 ---
+results = []
 progress_bar = st.progress(0)
-index_names = list(TARGETS.keys())
 
-for i, name in enumerate(index_names):
-    config = TARGETS[name]
-    res = fetch_data_safe(name, config[0], config[1], lookback_years, config[2])
-    if res and "当前估值" in res:
-        # 判定逻辑
-        p = res['百分位']
-        b = res['年线偏离']
+for i, (name, code) in enumerate(TARGETS.items()):
+    df = fetch_stable_data(name)
+    if df is not None and not df.empty:
+        # 截取历史区间用于计算锚点
+        start_date = datetime.now() - timedelta(days=lookback_years*365)
+        hist_df = df[df['date'] >= start_date].copy()
         
-        if p < 20 and b < -10:
-            status, color = "🌧️ 等雨来", "green"
-            money = base_money * (1.5 + (20 - p)/10)
-        elif p < 20:
-            status, color = "🌦️ 雨已至", "blue"
-            money = base_money * 1.2
-        elif p > 80:
-            status, color = "☀️ 盛夏过热", "red"
-            money = 0
-        else:
-            status, color = "⛅ 正常观望", "black"
-            money = base_money if p < 50 else 0
+        # 1. 当前值
+        curr_pe = hist_df.iloc[-1]['pe']
+        curr_pb = hist_df.iloc[-1]['pb']
+        curr_roe = hist_df.iloc[-1]['roe']
         
-        res['当前状态'] = status
-        res['建议买入金额'] = f"¥{int(money)}" if money > 0 else "停止买入"
-        data_rows.append(res)
-    progress_bar.progress((i + 1) / len(index_names))
+        # 2. 计算近三年平均分红率 (排除异常值)
+        recent_3y = hist_df.tail(750)
+        avg_payout_3y = recent_3y['payout_ratio'].clip(0, 1).mean() 
+        
+        # 3. 确定回归目标 (目标ROE取均值，目标PE取中位数)
+        target_roe = hist_df['roe'].mean()
+        target_pe = hist_df['pe'].median()
+        
+        # 4. 净资产复利推演 (对应图片算法)
+        # 初始净资产 (B0) 归一化为 1/PB
+        b_start = 1.0 / curr_pb
+        # 每年增长率 g = 目标ROE * (1 - 分红率)
+        annual_g = target_roe * (1 - avg_payout_3y)
+        b_future = b_start * ((1 + annual_g) ** projection_years)
+        
+        # 5. 计算未来合理市值 (P = B_future * ROE_target * PE_target)
+        fair_value = b_future * target_roe * target_pe
+        total_growth = (fair_value - 1) * 100
+        
+        results.append({
+            "指数名称": name,
+            "当前ROE": f"{curr_roe*100:.2f}%",
+            "目标ROE": f"{target_roe*100:.2f}%",
+            "当前PE": round(curr_pe, 2),
+            "目标PE": round(target_pe, 2),
+            "3年平均分红率": f"{avg_payout_3y*100:.2f}%",
+            f"{projection_years}年后预期空间": f"{total_growth:.2f}%",
+            "建议动作": "🌧️ 等雨来" if total_growth > 50 else "🌤️ 观望"
+        })
+    progress_bar.progress((i + 1) / len(TARGETS))
 
-if data_rows:
-    df = pd.DataFrame(data_rows)
-    st.table(df[['指数名称', '更新日期', '当前估值', '百分位', '年线偏离', '当前状态', '建议买入金额']])
+# --- 5. 结果展示 ---
+if results:
+    res_df = pd.DataFrame(results)
+    res_df = res_df.sort_values(f"{projection_years}年后预期空间", ascending=False)
+    
+    st.subheader(f"📊 基于 {lookback_years} 年历史数据的复利模型扫描")
+    
+    # 样式美化
+    def color_growth(val):
+        color = 'green' if float(val.replace('%','')) > 50 else 'black'
+        return f'color: {color}'
+
+    st.table(res_df.style.applymap(color_growth, subset=[f"{projection_years}年后预期空间"]))
+
+    st.markdown(f"""
+    ---
+    ### 📖 算法逻辑校验（严格对齐 Excel）：
+    - **净资产底座**：我们假设当前价格为 1，则账面价值为 $1/PB$。
+    - **内生增长**：假设每年企业赚取的利润，在扣除 **{results[0]['3年平均分红率'] if results else '38%'}** 的分红后，全部留存。
+    - **等雨时刻**：当市场 ROE 从当前的低谷回归到历史平均水平，且 PE 从低估回归到中位数时，**复利 + 盈利回升 + 估值修复** 三者相乘。
+    - **避坑提示**：如果一个指数 ROE 极低且分红率极高，其净资产几乎不增长，此时只能干等 PE 修复。
+    """)
 else:
-    st.error("⚠️ 暂时无法调取数据。原因可能是：1.接口正处于维护期 2.海外服务器请求受限。")
-    st.info("💡 解决办法：请稍后手动点击上方“刷新数据”按钮。")
-
-st.caption("提示：数据源来自 FundDB 及 Sina Finance。")
+    st.error("无法获取数据。请尝试在本地运行，或检查 `akshare` 库是否为最新版本。")
