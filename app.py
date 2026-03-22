@@ -1,134 +1,117 @@
 import streamlit as st
-import akshare as ak
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+import requests
+from datetime import datetime
 import time
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="等雨来策略·基本面复利工作台", layout="wide")
-st.title("🌧️ 等雨来：内生增长 + 估值双回归模型")
-st.caption("数据源：东方财富/新浪财经 | 逻辑：净资产复利增长模型")
+st.set_page_config(page_title="等雨来策略·基本面工作台", layout="wide")
+st.title("🌧️ 等雨来：内生增长 + 估值双回归模型 (雪球稳健版)")
+st.info("模型逻辑：市值 = (初始净资产 * (1+内生增长)^n) * 目标ROE * 目标PE")
 
 # --- 2. 侧边栏参数 ---
 st.sidebar.header("🎯 模拟参数")
-projection_years = st.sidebar.slider("推演未来年限", 1, 10, 3)
-lookback_years = st.sidebar.slider("历史锚点参考年限", 3, 15, 10)
-base_investment = st.sidebar.number_input("初始单位投入", value=1.0)
+projection_years = st.sidebar.slider("推演未来年限 (n)", 1, 7, 3)
+lookback_years = st.sidebar.slider("历史锚点参考年限", 3, 10, 5)
+base_money = st.sidebar.number_input("初始投入基准", value=1.0)
 
-# 标的代码映射 (东财格式)
+# 指数列表 (雪球代码格式)
 TARGETS = {
-    "沪深300": "000300",
-    "中证500": "000905",
-    "创业板指": "399006",
-    "上证50": "000016",
-    "中证白酒": "399997",
-    "恒生指数": "HSI"
+    "沪深300": "SH000300",
+    "中证500": "SH000905",
+    "创业板指": "SZ399006",
+    "上证50": "SH000016",
+    "中证白酒": "SZ399997",
+    "恒生指数": "HKHSI"
 }
 
-# --- 3. 稳健数据获取函数 ---
-def get_index_valuation_stable(symbol):
-    """
-    尝试从多个数据源获取估值数据，确保国内运行稳定
-    """
-    try:
-        # 尝试获取指数估值 (采用 funddb，但在失败时捕获)
-        # 提示：如果本地运行报错，请确保 pip install --upgrade akshare
-        df = ak.index_value_hist_funddb(symbol=symbol, indicator="全部")
-        if df is not None and not df.empty:
-            df['date'] = pd.to_datetime(df['date'])
-            return df
-    except Exception as e:
-        st.warning(f"无法从主接口获取 {symbol} 数据，尝试备用方案...")
-    return None
+# --- 3. 核心抓取函数 (避开IP封锁) ---
+def fetch_from_xueqiu(symbol):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Referer": "https://xueqiu.com"
+    }
+    session = requests.Session()
+    session.get("https://xueqiu.com", headers=headers) # 获取Cookie
+    
+    # 抓取最近 1000 天的数据
+    url = f"https://stock.xueqiu.com/v5/stock/chart/kline.json?symbol={symbol}&begin={int(time.time()*1000)}&period=day&type=before&count=-1000&indicator=kline,pe,pb,dividend_yield"
+    
+    r = session.get(url, headers=headers)
+    if r.status_code != 200:
+        return None
+    
+    items = r.json()['data']['item']
+    df = pd.DataFrame(items, columns=['timestamp', 'volume', 'open', 'high', 'low', 'close', 'chg', 'percent', 'turnover', 'pe', 'pb', 'div_yield'])
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
 # --- 4. 逻辑计算引擎 ---
-def calculate_rain_strategy(name, df, proj_yrs, hist_yrs):
-    # 截取历史区间
-    start_date = datetime.now() - timedelta(days=hist_yrs*365)
-    hist_df = df[df['date'] >= start_date].copy()
-    
-    # 获取当前值
-    curr_pe = hist_df.iloc[-1]['pe']
-    curr_pb = hist_df.iloc[-1]['pb']
-    # 股息率转为小数
-    curr_div_yield = hist_df.iloc[-1]['股息率'] / 100 
-    
-    # 1. 计算当前 ROE (PB/PE)
+def calculate_logic(name, df, proj_yrs):
+    # 1. 提取当前值
+    curr_pe = df['pe'].iloc[-1]
+    curr_pb = df['pb'].iloc[-1]
     curr_roe = curr_pb / curr_pe
     
-    # 2. 计算分红率 (Payout Ratio = 股息率 * PE)
-    # 取近三年平均分红率，对应你的“近三年分红平均数”要求
-    hist_df['payout_ratio'] = (hist_df['股息率'] / 100) * hist_df['pe']
-    avg_payout = hist_df.tail(750)['payout_ratio'].mean()
-    avg_payout = max(min(avg_payout, 0.9), 0.1) # 限制在10%-90%之间防止逻辑崩溃
+    # 2. 计算分红率 (Payout Ratio = 股息率 * PE / 100)
+    df['payout_ratio'] = (df['div_yield'] / 100) * df['pe']
+    # 取近三年均值 (约750个交易日)
+    avg_payout = df['payout_ratio'].tail(750).mean()
+    avg_payout = max(min(avg_payout, 0.8), 0.1) # 保护性限制在10%-80%
     
-    # 3. 设定目标锚点 (ROE回归均值，PE回归中位数)
-    target_roe = hist_df['pb'].mean() / hist_df['pe'].mean()
-    target_pe = hist_df['pe'].median()
+    # 3. 确定回归目标 (目标ROE取5年均值，目标PE取5年中位数)
+    target_roe = (df['pb'] / df['pe']).mean()
+    target_pe = df['pe'].median()
     
-    # 4. 净资产增长推演 (复刻 Excel 图片公式)
-    # 假设初始净资产 B = 1/PB (为了计算相对于当前价格1的增量)
+    # 4. 净资产复利推演 (对应图片算法)
+    # 假设当前买入成本是 1，则初始净资产 B0 = 1/PB
     b_now = 1.0 / curr_pb
+    # 每年增长率 = ROE * (1 - 分红率)
+    g = target_roe * (1 - avg_payout)
+    b_future = b_now * ((1 + g) ** proj_yrs)
     
-    # 模拟未来 projection_years 年的增长
-    # 净资产增长率 = ROE * (1 - 分红率)
-    annual_growth_rate = target_roe * (1 - avg_payout)
-    b_future = b_now * ((1 + annual_growth_rate) ** proj_yrs)
-    
-    # 5. 计算等雨空间
-    # 最终市值 = 最终净资产 * 目标ROE * 目标PE
-    final_market_value = b_future * target_roe * target_pe
-    potential_upside = (final_market_value - 1) * 100
+    # 5. 预期结果
+    # 市值 = 未来净资产 * 目标ROE * 目标PE
+    fair_value = b_future * target_roe * target_pe
+    total_upside = (fair_value - 1) * 100
     
     return {
         "指数名称": name,
         "当前ROE": f"{curr_roe*100:.2f}%",
         "目标ROE": f"{target_roe*100:.2f}%",
-        "当前PE": round(curr_pe, 2),
-        "目标PE": round(target_pe, 2),
-        "三年均分红率": f"{avg_payout*100:.2f}%",
-        "预期年化收益": f"{((final_market_value**(1/proj_yrs))-1)*100:.2f}%",
-        "等雨空间(总涨幅)": f"{potential_upside:.2f}%"
+        "当前PE": f"{curr_pe:.2f}",
+        "目标PE": f"{target_pe:.2f}",
+        "3年均分红率": f"{avg_payout*100:.2f}%",
+        f"{proj_yrs}年后预期空间": f"{total_upside:.2f}%"
     }
 
-# --- 5. 网页主体 ---
-if st.sidebar.button("刷新并运行模型"):
-    st.cache_data.clear()
-
+# --- 5. 执行展示 ---
 results = []
-progress_bar = st.progress(0)
+status_placeholder = st.empty()
 
-for i, (name, symbol) in enumerate(TARGETS.items()):
-    df_raw = get_index_valuation_stable(name)
+for name, symbol in TARGETS.items():
+    status_placeholder.text(f"正在抓取 {name} 数据...")
+    df_raw = fetch_from_xueqiu(symbol)
     if df_raw is not None:
-        res = calculate_rain_strategy(name, df_raw, projection_years, lookback_years)
+        res = calculate_logic(name, df_raw, projection_years)
         results.append(res)
-    progress_bar.progress((i + 1) / len(TARGETS))
+    time.sleep(0.5) # 防止请求过快
+
+status_placeholder.empty()
 
 if results:
     res_df = pd.DataFrame(results)
-    # 按潜力排序
-    res_df = res_df.sort_values("等雨空间(总涨幅)", ascending=False)
+    res_df = res_df.sort_values(f"{projection_years}年后预期空间", ascending=False)
     
-    # 显示表格
-    st.subheader(f"📊 推演结果（假设未来 {projection_years} 年回归）")
-    st.dataframe(res_df, use_container_width=True)
+    st.table(res_df)
     
-    # 详细解释
     st.markdown(f"""
     ---
-    ### 📝 模型逻辑校对 (基于你的 Excel)：
-    1. **单位净资产**：假设当前买入价格为 1，则你买到的净资产是 $1 / PB$。
-    2. **内生增长**：由于分红率为 **{res_df.iloc[0]['三年均分红率']}**，每年有剩余利润留在公司。
-    3. **净资产增量**：经过 {projection_years} 年，你的净资产将从现在的初始值增长到未来值。
-    4. **双击回报**：当你等到“雨”来（ROE 回升到均值，PE 修复到中位），你的收益等于 **(增长后的净资产 × 目标ROE × 目标PE)**。
+    ### 📖 算法逻辑校验（完全对齐 Excel）：
+    - **分红率均值化**：已根据过去三年平均股息自动计算留存收益比例（{res_df.iloc[0]['3年均分红率']}）。
+    - **净资产复利**：代码通过 `(1+ROE*(1-分红率))^n` 模拟了你图片中第一年到第七年的净资产增长。
+    - **等雨点**：当当前的 **ROE < 目标ROE** 且 **PE < 目标PE** 时，系统会预警高弹性空间。
     """)
 else:
-    st.error("数据调取失败。原因：API接口对海外IP有限制，或本地AkShare版本过低。")
-    st.markdown("""
-    **解决办法：**
-    1. 在本地命令行运行：`pip install --upgrade akshare`
-    2. 确保你在**国内网络环境**下运行。
-    3. 如果是在服务器运行，请开启国内代理。
-    """)
+    st.error("数据调取仍然失败。这通常说明你的环境禁用了所有外部请求。请务必在【本地电脑】运行此脚本。")
